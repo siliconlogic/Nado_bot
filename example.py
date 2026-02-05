@@ -46,9 +46,9 @@ async def simple_trading_example():
         print("\n📊 Available Perpetual Products:")
         print("-" * 60)
         products = trader.get_perpetual_products()
-        for p in products[:5]:  # Show first 5
+        for p in products[:10]:  # Show first 10
             price_str = f"${p['price']:,.2f}" if p['price'] else "N/A"
-            print(f"  Product {p['product_id']:2d}: {p['symbol']:15s} Price: {price_str}")
+            print(f"  {p['product_id']:2d}. {p['symbol']:12s} {price_str:>15s}")
         
         # Step 2: Check account status
         print("\n💰 Account Information:")
