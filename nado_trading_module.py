@@ -88,6 +88,7 @@ class NadoTrader:
         self.subaccount_name = subaccount_name
         self.client = None
         self._products_cache = None
+        self._ticker_map = {}
         
     async def connect(self):
         """Initialize connection to Nado exchange."""
@@ -116,76 +117,55 @@ class NadoTrader:
             'spot': products.spot_products,
             'perp': products.perp_products
         }
-        print(f"✓ Loaded {len(products.perp_products)} perpetual products")
+
+        # Load ticker information from indexer
+        try:
+            tickers = self.client.context.indexer_client.get_tickers()
+            self._ticker_map = {
+                v['product_id']: v['base_currency']
+                for v in tickers.values()
+                if isinstance(v, dict) and 'product_id' in v and 'base_currency' in v
+            }
+            print(f"✓ Loaded {len(products.perp_products)} perpetual products with tickers")
+        except Exception as e:
+            print(f"⚠️  Could not load tickers: {e}")
+            self._ticker_map = {}
     
     def get_perpetual_products(self) -> List[Dict[str, Any]]:
         """
         Get list of available perpetual products.
-        
+
         Note: Product IDs are not sequential. Nado uses sparse numbering
         (typically even numbers: 2, 4, 6, 8, etc.) and not all IDs are active.
-        
+
         Returns:
-            List of perpetual products with their details
+            List of perpetual products with their details including actual ticker symbols
         """
         if not self._products_cache:
             raise RuntimeError("Not connected. Call connect() first.")
-        
-        # Extended product ID to ticker mapping
-        # Based on actual prices observed - Nado uses even product IDs
-        PRODUCT_TICKERS = {
-            2: 'BTC-PERP',   # ~$66,000
-            4: 'ETH-PERP',   # ~$1,950
-            6: 'SOL-PERP',   # ~$150-200
-            8: 'BNB-PERP',   # ~$82 (or could be another alt)
-            10: 'XRP-PERP',  # ~$1.23
-            12: 'ADA-PERP',  # ~$0.40-0.60
-            14: 'LTC-PERP',  # ~$654
-            16: 'ARB-PERP',  # ~$32
-            18: 'SUI-PERP',  # ~$216
-            20: 'SHIB-PERP', # ~$0.02
-            22: 'TON-PERP',  # ~$0.19
-            24: 'INJ-PERP',  # ~$0.94
-            26: 'LINK-PERP', # ~$111 (Chainlink)
-            28: 'ETH-PERP',  # ~$4,825 (alternate ETH product or scaled)
-            30: 'UNKNOWN-30',# $0.00 (inactive or no data)
-            32: 'AVAX-PERP', # ~$165 (Avalanche)
-            42: 'DOGE-PERP', # ~$0.03 (Dogecoin)
-            44: 'PEPE-PERP', # ~$0.02 (Pepe or similar meme coin)
-            46: 'MATIC-PERP',# ~$3.31 (Polygon)
-            48: 'XRP-PERP',  # ~$0.49 (XRP alt or scaled)
-            50: 'TRX-PERP',  # ~$0.08 (Tron)
-        }
-        
-        products = []
-        seen_product_ids = set()  # Track unique product IDs to avoid duplicates
+
+        # Use dictionary to ensure uniqueness by product_id
+        products_dict = {}
 
         for p in self._products_cache['perp']:
-            # Skip duplicates
-            if p.product_id in seen_product_ids:
+            product_id = p.product_id
+
+            # Skip if already processed (only keep first occurrence)
+            if product_id in products_dict:
                 continue
-            seen_product_ids.add(p.product_id)
 
-            # Try to get symbol from product attributes first
-            symbol = None
-            if hasattr(p, 'symbol'):
-                symbol = p.symbol
-            elif hasattr(p, 'name'):
-                symbol = p.name
+            # Get ticker symbol from the ticker map loaded from indexer API
+            symbol = self._ticker_map.get(product_id, f'PERP-{product_id}')
 
-            # Fallback to mapping or generic name
-            if not symbol:
-                symbol = PRODUCT_TICKERS.get(p.product_id, f'PERP-{p.product_id}')
-
-            products.append({
-                'product_id': p.product_id,
+            products_dict[product_id] = {
+                'product_id': product_id,
                 'symbol': symbol,
                 'oracle_price_x18': getattr(p, 'oracle_price_x18', None),
                 'price': from_x18(p.oracle_price_x18) if hasattr(p, 'oracle_price_x18') and p.oracle_price_x18 else None
-            })
+            }
 
-        # Sort by product_id for consistent ordering
-        products.sort(key=lambda x: x['product_id'])
+        # Convert to sorted list by product_id
+        products = sorted(products_dict.values(), key=lambda x: x['product_id'])
 
         return products
     
