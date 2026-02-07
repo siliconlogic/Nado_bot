@@ -41,6 +41,13 @@ from enum import Enum
 from nado_protocol.client import create_nado_client, NadoClientMode
 from nado_protocol.utils.math import to_x18, from_x18
 from nado_protocol.utils.bytes32 import subaccount_to_hex
+from nado_protocol.engine_client.types.execute import (
+    PlaceOrderParams,
+    CancelOrdersParams,
+    CancelProductOrdersParams
+)
+from nado_protocol.utils.execute import OrderParams
+from nado_protocol.indexer_client.types.query import IndexerSubaccountHistoricalOrdersParams
 
 
 class OrderSide(Enum):
@@ -89,6 +96,7 @@ class NadoTrader:
         self.client = None
         self._products_cache = None
         self._ticker_map = {}
+        self._pending_orders = {}  # Track orders not yet indexed: {digest: order_info}
         
     async def connect(self):
         """Initialize connection to Nado exchange."""
@@ -97,8 +105,7 @@ class NadoTrader:
                 self.mode,
                 self.private_key
             )
-            print(f"✓ Connected to Nado ({self.mode.value})")
-            print(f"  Using subaccount: {self.subaccount_name}")
+            print(f"✓ Connected to Nado ({self.mode.value}, subaccount: {self.subaccount_name})")
             
             # Cache products
             await self._load_products()
@@ -126,7 +133,6 @@ class NadoTrader:
                 for v in tickers.values()
                 if isinstance(v, dict) and 'product_id' in v and 'base_currency' in v
             }
-            print(f"✓ Loaded {len(products.perp_products)} perpetual products with tickers")
         except Exception as e:
             print(f"⚠️  Could not load tickers: {e}")
             self._ticker_map = {}
@@ -320,7 +326,7 @@ class NadoTrader:
         
         reduce_only_bit = 1 if reduce_only else 0
         trigger_type = 0  # NONE (0=NONE, 1=PRICE, 2=TWAP, 3=TWAP_CUSTOM)
-        
+
         # Build the appendix as a 128-bit integer
         appendix = (
             version |
@@ -329,39 +335,65 @@ class NadoTrader:
             (reduce_only_bit << 11) |
             (trigger_type << 12)
         )
-        
-        # Generate nonce (timestamp in microseconds + random bits)
-        nonce = int(time.time() * 1_000_000)
-        
+
         # Calculate expiration (30 days from now for GTC orders)
         if time_in_force == "GTC":
             expiration = int(time.time()) + (30 * 24 * 60 * 60)
         else:
             expiration = int(time.time()) + 300  # 5 minutes for IOC/FOK
         
+        # Get wallet address and derive subaccount using the SDK utility
+        wallet_address = self.client.context.signer.address
+        subaccount_hex = subaccount_to_hex(wallet_address, self.subaccount_name)
+
+        # Create OrderParams object
+        # Note: nonce is set to None to let the SDK auto-generate it with proper recv_time buffer
+        order_params = OrderParams(
+            sender=subaccount_hex,
+            priceX18=price_x18,
+            amount=amount_x18,
+            expiration=expiration,
+            nonce=None,  # SDK will auto-generate with 90-second recv_time buffer
+            appendix=appendix
+        )
+
+        # Create PlaceOrderParams object
+        place_order_params = PlaceOrderParams(
+            product_id=product_id,
+            order=order_params
+        )
+
         # Place order using SDK
         try:
-            result = self.client.market.place_order(
-                product_id=product_id,
-                price_x18=str(price_x18),
-                amount_x18=str(amount_x18),
-                expiration=expiration,
-                nonce=nonce,
-                appendix=appendix
-            )
-            
+            result = self.client.market.place_order(params=place_order_params)
+
+            # Extract digest from the response
+            digest = result.data.digest if result.data else 'unknown'
+
             order_info = {
                 'success': True,
-                'order_id': result.get('digest', 'unknown'),
+                'order_id': digest,
                 'product_id': product_id,
                 'side': side.value,
                 'price': price,
                 'size': size,
-                'status': result.get('status', 'submitted'),
+                'status': result.status,
                 'timestamp': time.time()
             }
-            
-            print(f"✓ {side.value.upper()} limit order placed: {size} @ {price}")
+
+            # Track this order locally until indexer picks it up
+            self._pending_orders[digest] = {
+                'digest': digest,
+                'product_id': product_id,
+                'price': price,
+                'amount': size if side == OrderSide.BUY else -size,
+                'filled': 0,
+                'side': side.value,
+                'timestamp': time.time(),
+                'local': True  # Mark as locally tracked
+            }
+
+            print(f"✓ Order placed: {side.value.upper()} {size} @ ${price}")
             return order_info
             
         except Exception as e:
@@ -378,22 +410,35 @@ class NadoTrader:
     async def cancel_order(self, product_id: int, order_digest: str) -> Dict[str, Any]:
         """
         Cancel a specific order.
-        
+
         Args:
             product_id: Product ID of the order
             order_digest: Order digest (ID) to cancel
-            
+
         Returns:
             Cancellation result
         """
         self._ensure_connected()
-        
+
+        # Get wallet address and derive subaccount
+        wallet_address = self.client.context.signer.address
+        subaccount_hex = subaccount_to_hex(wallet_address, self.subaccount_name)
+
         try:
-            result = self.client.market.cancel_orders(
-                product_ids=[product_id],
-                digests=[order_digest]
+            # Create CancelOrdersParams object
+            cancel_params = CancelOrdersParams(
+                sender=subaccount_hex,
+                productIds=[product_id],
+                digests=[order_digest],
+                nonce=None  # Will be auto-generated
             )
-            
+
+            result = self.client.market.cancel_orders(params=cancel_params)
+
+            # Remove from pending orders if it was locally tracked
+            if order_digest in self._pending_orders:
+                del self._pending_orders[order_digest]
+
             return {
                 'success': True,
                 'cancelled': result,
@@ -410,32 +455,54 @@ class NadoTrader:
     async def cancel_all_orders(self, product_id: Optional[int] = None) -> Dict[str, Any]:
         """
         Cancel all orders for a product or all products.
-        
+
         Args:
             product_id: Product ID to cancel orders for (None = all products)
-            
+
         Returns:
             Cancellation result
         """
         self._ensure_connected()
-        
+
+        # Get wallet address and derive subaccount
+        wallet_address = self.client.context.signer.address
+        subaccount_hex = subaccount_to_hex(wallet_address, self.subaccount_name)
+
         try:
             if product_id is not None:
-                result = self.client.market.cancel_product_orders(
-                    product_id=product_id
+                # Create CancelProductOrdersParams object
+                cancel_params = CancelProductOrdersParams(
+                    sender=subaccount_hex,
+                    productIds=[product_id],
+                    nonce=None  # Will be auto-generated
                 )
+                result = self.client.market.cancel_product_orders(params=cancel_params)
                 message = f"✓ Cancelled all orders for product {product_id}"
+
+                # Remove pending orders for this product
+                digests_to_remove = [
+                    digest for digest, order in self._pending_orders.items()
+                    if order['product_id'] == product_id
+                ]
+                for digest in digests_to_remove:
+                    del self._pending_orders[digest]
             else:
                 # Cancel for all perpetual products
                 results = []
                 for product in self._products_cache['perp']:
-                    r = self.client.market.cancel_product_orders(
-                        product_id=product.product_id
+                    cancel_params = CancelProductOrdersParams(
+                        sender=subaccount_hex,
+                        productIds=[product.product_id],
+                        nonce=None  # Will be auto-generated
                     )
+                    r = self.client.market.cancel_product_orders(params=cancel_params)
                     results.append(r)
                 result = results
                 message = "✓ Cancelled all orders for all products"
-            
+
+                # Clear all pending orders
+                self._pending_orders.clear()
+
             print(message)
             return {
                 'success': True,
@@ -448,6 +515,40 @@ class NadoTrader:
                 'error': str(e)
             }
     
+    async def get_order_by_digest(self, order_digest: str) -> Optional[Dict[str, Any]]:
+        """
+        Get order details by digest.
+
+        Args:
+            order_digest: Order digest (ID) to query
+
+        Returns:
+            Order details if found, None otherwise
+        """
+        self._ensure_connected()
+
+        try:
+            orders_result = self.client.context.indexer_client.get_historical_orders_by_digest(
+                digests=[order_digest]
+            )
+
+            if orders_result.orders and len(orders_result.orders) > 0:
+                order = orders_result.orders[0]
+                return {
+                    'digest': order.digest,
+                    'product_id': order.product_id,
+                    'price': from_x18(order.price_x18),
+                    'amount': from_x18(order.amount),
+                    'base_filled': from_x18(order.base_filled),
+                    'quote_filled': from_x18(order.quote_filled),
+                    'side': 'buy' if float(order.amount) > 0 else 'sell',
+                    'timestamp': order.timestamp
+                }
+            return None
+        except Exception as e:
+            print(f"⚠️  Error querying order {order_digest[:16]}...: {e}")
+            return None
+
     async def get_open_orders(self, product_id: Optional[int] = None) -> List[Dict[str, Any]]:
         """
         Get all open orders.
@@ -463,48 +564,97 @@ class NadoTrader:
         # Get wallet address and derive subaccount using the SDK utility
         wallet_address = self.client.context.signer.address
         subaccount_hex = subaccount_to_hex(wallet_address, self.subaccount_name)
-        
-        # Query orders from indexer
-        orders_result = self.client.context.indexer_client.get_subaccount_orders(
-            subaccount=subaccount_hex,
-            product_id=product_id
+
+        # Create query parameters
+        query_params = IndexerSubaccountHistoricalOrdersParams(
+            subaccounts=[subaccount_hex],
+            product_ids=[product_id] if product_id is not None else None
         )
-        
+
+        # Query orders from indexer
+        orders_result = self.client.context.indexer_client.get_subaccount_historical_orders(
+            query_params
+        )
+
         open_orders = []
+
         for order in orders_result.orders:
-            if order.status == 'open':
-                open_orders.append({
-                    'digest': order.digest,
-                    'product_id': order.product_id,
-                    'price': from_x18(order.price_x18),
-                    'amount': from_x18(order.amount),
-                    'side': 'buy' if float(from_x18(order.amount)) > 0 else 'sell',
-                    'timestamp': order.timestamp,
-                    'status': order.status
-                })
-        
+            # Check if order is unfilled by comparing base_filled to amount
+            # An order is "open" if it hasn't been fully filled
+            try:
+                # Convert from string format (x18) to float
+                # Both base_filled and amount can be negative for sell orders
+                base_filled_x18 = abs(float(order.base_filled))
+                amount_x18 = abs(float(order.amount))
+
+                # An order is open if base_filled is 0 or very small compared to amount
+                # We use a small threshold to account for partial fills
+                is_open = base_filled_x18 < (amount_x18 * 0.99)  # Less than 99% filled
+
+                if is_open:
+                    open_orders.append({
+                        'digest': order.digest,
+                        'product_id': order.product_id,
+                        'price': from_x18(order.price_x18),
+                        'amount': from_x18(order.amount),
+                        'filled': abs(from_x18(order.base_filled)),
+                        'side': 'buy' if float(order.amount) > 0 else 'sell',
+                        'timestamp': order.timestamp
+                    })
+            except Exception as e:
+                # If we can't parse the order, skip it
+                print(f"⚠️  Skipping order {order.digest[:16]}...: {e}")
+                continue
+
+        # Clean up pending orders: remove any that are now indexed or older than 5 minutes
+        current_time = time.time()
+        indexed_digests = {order['digest'] for order in open_orders}
+        digests_to_remove = []
+
+        for digest, pending_order in self._pending_orders.items():
+            # Remove if indexed or older than 5 minutes (300 seconds)
+            if digest in indexed_digests or (current_time - pending_order['timestamp'] > 300):
+                digests_to_remove.append(digest)
+
+        for digest in digests_to_remove:
+            del self._pending_orders[digest]
+
+        # Add pending orders that match the product filter and aren't already in results
+        for digest, pending_order in self._pending_orders.items():
+            # Filter by product_id if specified
+            if product_id is not None and pending_order['product_id'] != product_id:
+                continue
+
+            # Only add if not already in indexed results
+            if digest not in indexed_digests:
+                open_orders.append(pending_order)
+
         return open_orders
     
     async def get_positions(self) -> List[Dict[str, Any]]:
         """
         Get all open positions.
-        
+
         Returns:
             List of positions with details
         """
         account_info = await self.get_account_info()
-        
+
+        # Get valid perpetual product IDs
+        valid_product_ids = {p.product_id for p in self._products_cache['perp']}
+
         positions = []
         for balance in account_info['balances']:
-            # Perpetual positions have non-zero balance
-            if balance['product_id'] > 0 and balance['balance'] != 0:
+            # Only show positions for active perpetual products with non-zero balance
+            if (balance['product_id'] in valid_product_ids and
+                balance['balance'] != 0):
                 positions.append({
                     'product_id': balance['product_id'],
                     'size': balance['balance'],
                     'unrealized_pnl': balance['unrealized_pnl'],
                     'side': 'long' if balance['balance'] > 0 else 'short'
                 })
-        
+
         return positions
     
     async def get_orderbook(self, product_id: int, depth: int = 10) -> Dict[str, Any]:
@@ -572,56 +722,64 @@ async def main():
     
     # Using async context manager
     async with NadoTrader(PRIVATE_KEY, mode=MODE) as trader:
-        
-        # Get available products
+
+        # Get available products (for symbol lookup)
         products = trader.get_perpetual_products()
-        print("\n📊 Available Perpetuals:")
-        print("-" * 60)
-        for p in products:  # Show all perpetuals
-            price_str = f"${p['price']:,.2f}" if p['price'] else "N/A"
-            print(f"  {p['product_id']:2d}. {p['symbol']:12s} {price_str:>15s}")
-        print(f"\n  Total: {len(products)} perpetual products")
-        
-        # Get account info
-        account = await trader.get_account_info()
-        print(f"\nAccount Health: {account['health']}")
-        print(f"Subaccount: {account['subaccount']}")
-        
-        # Example: Place a buy limit order for BTC-PERP (product_id=1)
-        # Uncomment to actually place orders:
-        """
-        buy_order = await trader.buy_limit(
-            product_id=1,
-            price=45000.0,
-            size=0.01,
-            post_only=True
-        )
-        print(f"\nBuy Order Result: {buy_order}")
-        
-        # Place a sell limit order
+        product_map = {p['product_id']: p['symbol'] for p in products}
+
+        # Display all available products
+        print(f"\n📊 Available Products: {len(products)}")
+        for p in products:
+            price_str = f"${p['price']:>10,.2f}" if p['price'] else "N/A".rjust(10)
+            print(f"  ID: {p['product_id']:2d} | {p['symbol']:8s} | Price: {price_str}")
+
+        # Example: Place a buy limit order (LONG)
+        # buy_order = await trader.buy_limit(
+        #     product_id=8,      # SOL-PERP
+        #     price=85.0,        # Buy at $85
+        #     size=1.8,          # Size: 1.8 SOL
+        #     post_only=True     # Only maker (won't execute immediately)
+        # )
+
+        # Example: Place a sell limit order (SHORT)
         sell_order = await trader.sell_limit(
-            product_id=1,
-            price=46000.0,
-            size=0.01,
-            post_only=True
+            product_id=8,      # SOL-PERP
+            price=87.0,        # Sell at $90
+            size=1.8,          # Size: 1.8 SOL
+            post_only=True     # Only maker (won't execute immediately)
         )
-        print(f"\nSell Order Result: {sell_order}")
-        
-        # Get open orders
-        open_orders = await trader.get_open_orders(product_id=1)
-        print(f"\nOpen Orders: {len(open_orders)}")
+
+        # Wait a moment for orders to be placed
+        await asyncio.sleep(1)
+
+        # Get all open orders
+        open_orders = await trader.get_open_orders()
+
+        print(f"\n📋 Open Orders: {len(open_orders)}")
         for order in open_orders:
-            print(f"  {order['side'].upper()} {order['amount']} @ {order['price']}")
-        
-        # Get positions
+            size = abs(float(order['amount']))
+            price = float(order['price'])
+            order_value = size * price
+            market = product_map.get(order['product_id'], f"Product {order['product_id']}")
+            print(f"  {market:8s} | {order['side'].upper():4s} | Size: {size:>8.4f} | Price: ${price:>8.2f} | Value: ${order_value:>10.2f}")
+
+        # Get all open positions
         positions = await trader.get_positions()
-        print(f"\nPositions: {len(positions)}")
-        for pos in positions:
-            print(f"  Product {pos['product_id']}: {pos['side']} {pos['size']}")
-        
+
+        print(f"\n📊 Open Positions: {len(positions)}")
+        if len(positions) == 0:
+            print("  No open positions")
+        else:
+            for pos in positions:
+                market = product_map.get(pos['product_id'], f"Product {pos['product_id']}")
+                size = abs(pos['size'])
+                pnl = pos['unrealized_pnl']
+                pnl_str = f"${pnl:>10.2f}" if pnl != 0 else "$      0.00"
+                print(f"  {market:8s} | {pos['side'].upper():5s} | Size: {size:>10.4f} | Unrealized PnL: {pnl_str}")
+
         # Cancel all orders
-        await trader.cancel_all_orders(product_id=1)
-        """
+        # await trader.cancel_all_orders(product_id=8)
+        
 
 
 if __name__ == "__main__":
