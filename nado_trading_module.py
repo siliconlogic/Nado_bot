@@ -47,7 +47,6 @@ from nado_protocol.engine_client.types.execute import (
     CancelProductOrdersParams
 )
 from nado_protocol.utils.execute import OrderParams
-from nado_protocol.indexer_client.types.query import IndexerSubaccountHistoricalOrdersParams
 
 
 class OrderSide(Enum):
@@ -552,82 +551,73 @@ class NadoTrader:
     async def get_open_orders(self, product_id: Optional[int] = None) -> List[Dict[str, Any]]:
         """
         Get all open orders.
-        
+
         Args:
             product_id: Filter by product ID (None = all products)
-            
+
         Returns:
             List of open orders
         """
         self._ensure_connected()
-        
+
         # Get wallet address and derive subaccount using the SDK utility
         wallet_address = self.client.context.signer.address
         subaccount_hex = subaccount_to_hex(wallet_address, self.subaccount_name)
 
-        # Create query parameters
-        query_params = IndexerSubaccountHistoricalOrdersParams(
-            subaccounts=[subaccount_hex],
-            product_ids=[product_id] if product_id is not None else None
-        )
+        # Query open orders from engine (real-time, no lag)
+        if product_id is not None:
+            # Get orders for specific product
+            # Returns SubaccountOpenOrdersData with .orders list
+            orders_result = self.client.context.engine_client.get_subaccount_open_orders(
+                product_id=product_id,
+                sender=subaccount_hex
+            )
+            orders_list = orders_result.orders if hasattr(orders_result, 'orders') else []
+        else:
+            # Get orders for all perpetual products
+            # Returns SubaccountMultiProductsOpenOrdersData with .product_orders list
+            all_product_ids = [p.product_id for p in self._products_cache['perp']]
+            orders_result = self.client.context.engine_client.get_subaccount_multi_products_open_orders(
+                product_ids=all_product_ids,
+                sender=subaccount_hex
+            )
 
-        # Query orders from indexer
-        orders_result = self.client.context.indexer_client.get_subaccount_historical_orders(
-            query_params
-        )
+            # Multi-products returns SubaccountMultiProductsOpenOrdersData with .product_orders
+            # Each ProductOpenOrdersData contains product_id and orders list
+            orders_list = []
+            if hasattr(orders_result, 'product_orders'):
+                for product_orders in orders_result.product_orders:
+                    if hasattr(product_orders, 'orders'):
+                        orders_list.extend(product_orders.orders)
 
         open_orders = []
 
-        for order in orders_result.orders:
-            # Check if order is unfilled by comparing base_filled to amount
-            # An order is "open" if it hasn't been fully filled
+        # Parse orders from engine response
+        for order in orders_list:
             try:
-                # Convert from string format (x18) to float
-                # Both base_filled and amount can be negative for sell orders
-                base_filled_x18 = abs(float(order.base_filled))
-                amount_x18 = abs(float(order.amount))
+                # Convert amount to float for side determination
+                amount = from_x18(order.amount)
 
-                # An order is open if base_filled is 0 or very small compared to amount
-                # We use a small threshold to account for partial fills
-                is_open = base_filled_x18 < (amount_x18 * 0.99)  # Less than 99% filled
-
-                if is_open:
-                    open_orders.append({
-                        'digest': order.digest,
-                        'product_id': order.product_id,
-                        'price': from_x18(order.price_x18),
-                        'amount': from_x18(order.amount),
-                        'filled': abs(from_x18(order.base_filled)),
-                        'side': 'buy' if float(order.amount) > 0 else 'sell',
-                        'timestamp': order.timestamp
-                    })
+                # Engine returns OrderData objects with:
+                # - price_x18: price in x18 format
+                # - amount: order amount (positive=buy, negative=sell)
+                # - unfilled_amount: remaining unfilled amount
+                # - digest: order ID
+                # - placed_at: timestamp when order was placed
+                open_orders.append({
+                    'digest': order.digest,
+                    'product_id': order.product_id,
+                    'price': from_x18(order.price_x18),
+                    'amount': amount,
+                    'unfilled_amount': from_x18(order.unfilled_amount) if hasattr(order, 'unfilled_amount') else abs(amount),
+                    'side': 'buy' if amount > 0 else 'sell',
+                    'placed_at': order.placed_at if hasattr(order, 'placed_at') else None,
+                    'expiration': order.expiration if hasattr(order, 'expiration') else None
+                })
             except Exception as e:
                 # If we can't parse the order, skip it
-                print(f"⚠️  Skipping order {order.digest[:16]}...: {e}")
+                print(f"⚠️  Skipping order: {e}")
                 continue
-
-        # Clean up pending orders: remove any that are now indexed or older than 5 minutes
-        current_time = time.time()
-        indexed_digests = {order['digest'] for order in open_orders}
-        digests_to_remove = []
-
-        for digest, pending_order in self._pending_orders.items():
-            # Remove if indexed or older than 5 minutes (300 seconds)
-            if digest in indexed_digests or (current_time - pending_order['timestamp'] > 300):
-                digests_to_remove.append(digest)
-
-        for digest in digests_to_remove:
-            del self._pending_orders[digest]
-
-        # Add pending orders that match the product filter and aren't already in results
-        for digest, pending_order in self._pending_orders.items():
-            # Filter by product_id if specified
-            if product_id is not None and pending_order['product_id'] != product_id:
-                continue
-
-            # Only add if not already in indexed results
-            if digest not in indexed_digests:
-                open_orders.append(pending_order)
 
         return open_orders
     
@@ -736,18 +726,18 @@ async def main():
         # Example: Place a buy limit order (LONG)
         # buy_order = await trader.buy_limit(
         #     product_id=8,      # SOL-PERP
-        #     price=85.0,        # Buy at $85
+        #     price=86.0,        # Buy at $85
         #     size=1.8,          # Size: 1.8 SOL
         #     post_only=True     # Only maker (won't execute immediately)
         # )
 
         # Example: Place a sell limit order (SHORT)
-        sell_order = await trader.sell_limit(
-            product_id=8,      # SOL-PERP
-            price=87.0,        # Sell at $90
-            size=1.8,          # Size: 1.8 SOL
-            post_only=True     # Only maker (won't execute immediately)
-        )
+        # sell_order = await trader.sell_limit(
+        #     product_id=8,      # SOL-PERP
+        #     price=89.0,        # Sell at $90
+        #     size=1.8,          # Size: 1.8 SOL
+        #     post_only=True     # Only maker (won't execute immediately)
+        # )
 
         # Wait a moment for orders to be placed
         await asyncio.sleep(1)
@@ -756,12 +746,16 @@ async def main():
         open_orders = await trader.get_open_orders()
 
         print(f"\n📋 Open Orders: {len(open_orders)}")
-        for order in open_orders:
-            size = abs(float(order['amount']))
-            price = float(order['price'])
-            order_value = size * price
-            market = product_map.get(order['product_id'], f"Product {order['product_id']}")
-            print(f"  {market:8s} | {order['side'].upper():4s} | Size: {size:>8.4f} | Price: ${price:>8.2f} | Value: ${order_value:>10.2f}")
+        if len(open_orders) == 0:
+            print("  No open orders")
+        else:
+            for order in open_orders:
+                size = abs(float(order['amount']))
+                unfilled = float(order.get('unfilled_amount', size))
+                price = float(order['price'])
+                order_value = unfilled * price
+                market = product_map.get(order['product_id'], f"Product {order['product_id']}")
+                print(f"  {market:8s} | {order['side'].upper():4s} | Size: {size:>8.4f} | Unfilled: {unfilled:>8.4f} | Price: ${price:>8.2f} | Value: ${order_value:>10.2f}")
 
         # Get all open positions
         positions = await trader.get_positions()
