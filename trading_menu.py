@@ -119,12 +119,27 @@ class TradingMenu:
             if total_equity is not None:
                 print(f"  {'Total Account Value:':25s} ${total_equity:>15,.2f}")
 
+            # Get open orders
+            open_orders = await self.trader.get_open_orders()
+
+            # Show open orders
+            if open_orders:
+                print(f"\n  Open Orders: ({len(open_orders)})")
+                for order in open_orders:
+                    size = abs(float(order['amount']))
+                    unfilled = float(order.get('unfilled_amount', size))
+                    price = float(order['price'])
+                    product_symbol = self.product_map.get(order['product_id'], {}).get('symbol', f"Product {order['product_id']}")
+                    print(f"    {product_symbol:10s} | {order['side'].upper():4s} | Size: {unfilled:>8.4f} | Price: ${price:>10,.2f}")
+            else:
+                print(f"\n  No open orders")
+
             # Get positions using the dedicated method (same as option 6)
             positions = await self.trader.get_positions()
 
-            # Show perpetual positions if any
+            # Show perpetual positions
             if positions:
-                print(f"\n  Open Positions:")
+                print(f"\n  Open Positions: ({len(positions)})")
                 for pos in positions:
                     product_symbol = self.product_map.get(pos['product_id'], {}).get('symbol', f"Product {pos['product_id']}")
                     size = abs(pos['size'])
