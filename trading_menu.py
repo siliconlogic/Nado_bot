@@ -89,6 +89,58 @@ class TradingMenu:
 
     async def show_products_info(self):
         """Display information about available products."""
+        # Get account information first
+        try:
+            account_info = await self.trader.get_account_info()
+            health = account_info.get('health')
+
+            # Display account balances
+            print("\n" + "="*60)
+            print("💰 Account Information")
+            print("="*60)
+
+            # Extract margin information from health
+            from nado_protocol.utils.math import from_x18
+            available_margin = None
+            total_equity = None
+
+            if health and len(health) >= 3:
+                # Health[0] = Initial health (available margin for new positions)
+                # Health[1] = Maintenance health
+                # Health[2] = Total equity
+                if hasattr(health[0], 'health'):
+                    available_margin = from_x18(int(health[0].health))
+                if hasattr(health[2], 'health'):
+                    total_equity = from_x18(int(health[2].health))
+
+            # Display margin information
+            if available_margin is not None:
+                print(f"\n  {'Available Margin:':25s} ${available_margin:>15,.2f}")
+            if total_equity is not None:
+                print(f"  {'Total Account Value:':25s} ${total_equity:>15,.2f}")
+
+            # Get positions using the dedicated method (same as option 6)
+            positions = await self.trader.get_positions()
+
+            # Show perpetual positions if any
+            if positions:
+                print(f"\n  Open Positions:")
+                for pos in positions:
+                    product_symbol = self.product_map.get(pos['product_id'], {}).get('symbol', f"Product {pos['product_id']}")
+                    size = abs(pos['size'])
+                    pnl = pos['unrealized_pnl']
+                    print(f"    {product_symbol:10s} | {pos['side'].upper():5s} | Size: {size:>10.4f} | PnL: ${pnl:>10.2f}")
+            else:
+                print(f"\n  No open positions")
+
+            print("="*60)
+
+        except Exception as e:
+            print(f"\n⚠️  Could not fetch account balance: {e}")
+            import traceback
+            traceback.print_exc()
+
+        # Display products information
         print("\n" + "="*60)
         print(f"📊 Available Products: {len(self.products)}")
         print("="*60)
