@@ -105,21 +105,6 @@ class TradingMenu:
         if DEFAULT_PRODUCT_ID in self.product_map:
             print(f"\n⭐ Default trading product: {self.product_map[DEFAULT_PRODUCT_ID]['symbol']} (ID: {DEFAULT_PRODUCT_ID})")
 
-        # Get current market price for default product
-        if DEFAULT_PRODUCT_ID in self.product_map:
-            try:
-                orderbook = await self.trader.get_orderbook(DEFAULT_PRODUCT_ID, depth=1)
-                if orderbook['bids'] and orderbook['asks']:
-                    best_bid = orderbook['bids'][0]['price']
-                    best_ask = orderbook['asks'][0]['price']
-                    spread = best_ask - best_bid
-                    print(f"\n📈 Current Market (Product {DEFAULT_PRODUCT_ID}):")
-                    print(f"   Best Bid: ${best_bid:,.2f}")
-                    print(f"   Best Ask: ${best_ask:,.2f}")
-                    print(f"   Spread:   ${spread:,.2f}")
-            except Exception as e:
-                print(f"\n⚠️  Could not fetch orderbook: {e}")
-
         input("\nPress Enter to continue...")
 
     async def place_buy_order(self):
