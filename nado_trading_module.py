@@ -162,11 +162,34 @@ class NadoTrader:
             # Get ticker symbol from the ticker map loaded from indexer API
             symbol = self._ticker_map.get(product_id, f'PERP-{product_id}')
 
+            # Calculate max leverage from risk weights
+            # The initial margin weights determine the max leverage:
+            # max_leverage = 1 / |1 - initial_weight|
+            max_leverage = None
+            if hasattr(p, 'risk'):
+                risk = p.risk
+
+                # Try to get long weight initial (most products use this)
+                if hasattr(risk, 'long_weight_initial_x18'):
+                    long_weight_initial = from_x18(int(risk.long_weight_initial_x18))
+                    # Calculate max leverage: 1 / |1 - weight|
+                    margin_fraction = abs(1.0 - long_weight_initial)
+                    if margin_fraction > 0:
+                        max_leverage = 1.0 / margin_fraction
+
+                # Alternatively, could use short weight initial
+                elif hasattr(risk, 'short_weight_initial_x18'):
+                    short_weight_initial = from_x18(int(risk.short_weight_initial_x18))
+                    margin_fraction = abs(short_weight_initial - 1.0)
+                    if margin_fraction > 0:
+                        max_leverage = 1.0 / margin_fraction
+
             products_dict[product_id] = {
                 'product_id': product_id,
                 'symbol': symbol,
                 'oracle_price_x18': getattr(p, 'oracle_price_x18', None),
-                'price': from_x18(p.oracle_price_x18) if hasattr(p, 'oracle_price_x18') and p.oracle_price_x18 else None
+                'price': from_x18(p.oracle_price_x18) if hasattr(p, 'oracle_price_x18') and p.oracle_price_x18 else None,
+                'max_leverage': max_leverage
             }
 
         # Convert to sorted list by product_id

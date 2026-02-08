@@ -19,6 +19,26 @@ MODE = "mainnet"
 # Subaccount name (optional, default is "default")
 SUBACCOUNT_NAME = "default"
 
+# ============================================
+# Trading Order Settings
+# ============================================
+
+# Default product ID to trade (e.g., 8 for SOL-PERP, 2 for BTC-PERP, 4 for ETH-PERP)
+DEFAULT_PRODUCT_ID = 8
+
+# Default order size
+DEFAULT_ORDER_SIZE = 1.0
+
+# Order price offset from current market price (in USD)
+# For buy orders: order will be placed at (market_price - PRICE_OFFSET_USD)
+# For sell orders: order will be placed at (market_price + PRICE_OFFSET_USD)
+PRICE_OFFSET_USD = 1.0
+
+# Order settings
+POST_ONLY = True  # Only maker orders (won't execute immediately)
+REDUCE_ONLY = False  # Set to True to only reduce existing positions
+TIME_IN_FORCE = "GTC"  # GTC (Good Till Cancel), IOC (Immediate or Cancel), FOK (Fill or Kill)
+
 # Alternative: Load from environment variable
 # Uncomment the lines below to use environment variables instead:
 """
