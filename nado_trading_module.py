@@ -211,18 +211,54 @@ class NadoTrader:
         subaccount_hex = subaccount_to_hex(wallet_address, self.subaccount_name)
         
         info = self.client.context.engine_client.get_subaccount_info(subaccount_hex)
-        
+
+        # Calculate unrealized PnL for each balance
+        balances = []
+        for b in info.spot_balances + info.perp_balances:
+            amount = from_x18(int(b.balance.amount)) if b.balance.amount != '0' else 0
+
+            # Calculate PnL for perp positions
+            unrealized_pnl = 0
+            if amount != 0 and b.product_id in {p.product_id for p in self._products_cache['perp']}:
+                # Get current price from the fresh info object (more accurate)
+                # The info object contains the actual risk prices used for calculations
+                product_risk = next((p for p in self._products_cache['perp'] if p.product_id == b.product_id), None)
+
+                # Try to get price from the risk object in the fresh info
+                current_price = None
+                if hasattr(product_risk, 'risk') and hasattr(product_risk.risk, 'price_x18'):
+                    current_price = from_x18(int(product_risk.risk.price_x18))
+                elif hasattr(product_risk, 'oracle_price_x18'):
+                    current_price = from_x18(int(product_risk.oracle_price_x18))
+
+                if current_price:
+                    v_quote = from_x18(int(b.balance.v_quote_balance))
+
+                    # Debug for first position
+                    if amount != 0:
+                        print(f"\n🔍 PnL Calculation for Product {b.product_id}:")
+                        print(f"  Amount: {amount}")
+                        print(f"  Current Price: ${current_price:,.2f}")
+                        print(f"  v_quote_balance: ${v_quote:,.2f}")
+                        position_value = amount * current_price
+                        print(f"  Position Value: ${position_value:,.2f}")
+                        unrealized_pnl = position_value + v_quote
+                        print(f"  Calculated PnL: ${unrealized_pnl:,.2f}\n")
+                    else:
+                        # PnL = position_value + v_quote_balance
+                        position_value = amount * current_price
+                        unrealized_pnl = position_value + v_quote
+
+            balances.append({
+                'product_id': b.product_id,
+                'balance': amount,
+                'unrealized_pnl': unrealized_pnl
+            })
+
         return {
             'subaccount': subaccount_hex,
             'health': info.healths if hasattr(info, 'healths') else None,
-            'balances': [
-                {
-                    'product_id': b.product_id,
-                    'balance': from_x18(b.balance.amount),
-                    'unrealized_pnl': from_x18(b.balance.unrealized_pnl) if hasattr(b.balance, 'unrealized_pnl') else 0
-                }
-                for b in info.spot_balances + info.perp_balances
-            ]
+            'balances': balances
         }
     
     async def buy_limit(
@@ -670,6 +706,28 @@ class NadoTrader:
 
         return positions
     
+    async def get_funding_rate(self, product_id: int) -> Dict[str, Any]:
+        """
+        Get the current funding rate for a perpetual product.
+
+        Args:
+            product_id: Product ID (e.g., 2 for BTC-PERP)
+
+        Returns:
+            Dictionary with funding rate details
+        """
+        self._ensure_connected()
+
+        result = self.client.context.indexer_client.get_perp_funding_rate(product_id)
+
+        funding_rate = from_x18(int(result.funding_rate_x18))
+
+        return {
+            'product_id': result.product_id,
+            'funding_rate': funding_rate,
+            'update_time': result.update_time
+        }
+
     async def get_orderbook(self, product_id: int, depth: int = 10) -> Dict[str, Any]:
         """
         Get orderbook for a product.

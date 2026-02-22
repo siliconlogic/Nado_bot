@@ -84,6 +84,7 @@ class TradingMenu:
         print("4) Cancel all open orders")
         print("5) View open orders")
         print("6) View open positions")
+        print("7) View funding rate")
         print("0) Exit")
         print("-"*60)
 
@@ -444,6 +445,48 @@ class TradingMenu:
 
         input("\nPress Enter to continue...")
 
+    async def show_funding_rate(self):
+        """Display the current funding rate for a specified product."""
+        print("\n" + "="*60)
+        print("💹 FUNDING RATE")
+        print("="*60)
+
+        # Get product ID
+        product_id_input = input(f"Product ID (default: {DEFAULT_PRODUCT_ID}): ").strip()
+        product_id = int(product_id_input) if product_id_input else DEFAULT_PRODUCT_ID
+
+        if product_id not in self.product_map:
+            print(f"❌ Invalid product ID: {product_id}")
+            input("\nPress Enter to continue...")
+            return
+
+        product_symbol = self.product_map[product_id]['symbol']
+
+        try:
+            data = await self.trader.get_funding_rate(product_id)
+            daily_rate = data['funding_rate']
+            # API returns daily rate; divide by 24 for hourly
+            hourly_pct = daily_rate / 24 * 100
+            daily_pct = daily_rate * 100
+            annualized_pct = daily_rate * 100 * 365
+
+            print(f"\n📊 {product_symbol} (ID: {product_id})")
+            print(f"   Funding Rate:  {hourly_pct:>+.6f}%  (1h)")
+            print(f"   Daily Rate:    {daily_pct:>+.6f}%")
+            print(f"   Annualized:    {annualized_pct:>+.2f}%")
+            print(f"   Updated:       {data['update_time']}")
+
+            if daily_rate > 0:
+                print(f"\n   ℹ️  Positive rate: longs pay shorts")
+            elif daily_rate < 0:
+                print(f"\n   ℹ️  Negative rate: shorts pay longs")
+            else:
+                print(f"\n   ℹ️  Neutral: no funding payments")
+        except Exception as e:
+            print(f"\n❌ Error fetching funding rate: {e}")
+
+        input("\nPress Enter to continue...")
+
     async def run(self):
         """Run the interactive menu."""
         try:
@@ -465,6 +508,8 @@ class TradingMenu:
                     await self.view_open_orders()
                 elif choice == '6':
                     await self.view_positions()
+                elif choice == '7':
+                    await self.show_funding_rate()
                 elif choice == '0':
                     print("\n👋 Goodbye!")
                     break
